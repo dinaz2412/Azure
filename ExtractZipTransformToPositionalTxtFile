@@ -1,0 +1,143 @@
+using Azure.Storage.Blobs; // For accessing Azure Blob Storage
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+
+using System.Text;
+using System.Text.Json;
+using System.Xml.Linq;
+
+namespace ATF_3475_3546_ExtractRFIAZipFile;
+
+public class ATFRFIATransformationFunction
+{
+    private readonly ILogger<ATFRFIATransformationFunction> _logger;
+
+    public ATFRFIATransformationFunction(ILogger<ATFRFIATransformationFunction> logger)
+    {
+        _logger = logger;  // Initialize logger
+    }
+
+    // Class to hold the incoming JSON payload
+    public class RequestPayload
+    {
+        public string XmlContent { get; set; }          // Input XML string
+        public string Container { get; set; }           // Target blob container
+        public string TxtFileBlobName { get; set; }     // Filename to write to
+        public string Brand { get; set; }               // New: brand filter
+    }
+
+    [Function("ATFRFIATransformationFunction")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequestData req)
+    {
+        var jsonBody = await new StreamReader(req.Body).ReadToEndAsync(); // Read incoming body
+        var input = JsonSerializer.Deserialize<RequestPayload>(jsonBody); // Deserialize to object
+
+        if (input == null || string.IsNullOrWhiteSpace(input.XmlContent))
+        {
+            var badResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await badResponse.WriteStringAsync("Invalid or missing XML content.");
+            return badResponse;
+        }
+
+        var xdoc = XDocument.Parse(input.XmlContent);  // Load XML string
+        var records = xdoc.Descendants("ATFRFIAEXPORTENTITY"); // Get all record nodes
+
+        // 🔍 Filter records by Brand input
+        var filteredRecords = records
+            .Where(r => r.Element("BRANDID")?.Value?.Trim().Equals(input.Brand, StringComparison.OrdinalIgnoreCase) == true)
+            .ToList();
+
+        if (!filteredRecords.Any())
+        {
+            var emptyResponse = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            await emptyResponse.WriteStringAsync($"No records found for brand '{input.Brand}'. No file was created.");
+            return emptyResponse;
+        }
+
+        var outputBuilder = new StringBuilder(); // Build output line by line
+
+        foreach (var record in filteredRecords)
+        {
+            // Helper to safely get value from XML
+            string Get(string name) => record.Element(name)?.Value?.Trim() ?? "";
+
+            // Determine record type
+            string creationExported = Get("RFIACREATIONTOBEEXPORTED");
+            string cancellationExported = Get("RFIACANCELLATIONTOBEEXPORTED");
+
+            string recordType = creationExported == "Yes" ? "1" :
+                                cancellationExported == "Yes" ? "3" : " ";
+
+            // Get all required fields
+            string deviceId = Get("DEVICEID");
+            string oemCode = Get("OEMCODE");
+            string paymentTypeCode = Get("PAYMENTCODETYPEVALUE");
+            string paymentCode = paymentTypeCode == "0" ? deviceId : "";
+            string unblockMethod = Get("UNLOCKMETHODSTR");
+            string dealerCode = Get("DEALERCODE");
+
+            // Price conversion to cents
+            string priceRaw = Get("PRICE");
+            string price = "0000000000";
+            if (decimal.TryParse(priceRaw, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var priceValue))
+            {
+                long priceInCents = (long)Math.Round(priceValue * 100, MidpointRounding.AwayFromZero);
+                price = priceInCents.ToString().PadLeft(10, '0');
+            }
+            string ownerCode = Get("OWNERCODE");
+
+            // Pad function to handle positional format
+            string Pad(string value, int length, char padChar = ' ', bool rightAlign = false)
+            {
+                value = value ?? "";
+                value = rightAlign ? value.PadLeft(length, padChar) : value.PadRight(length, padChar);
+                return value.Length > length ? value.Substring(0, length) : value;
+            }
+
+            // Compose one line of output
+            string line = string.Concat(
+                Pad(recordType, 1),
+                Pad(deviceId, 17),
+                Pad("", 16),
+                Pad(oemCode, 4),
+                Pad(paymentTypeCode, 1),
+                Pad(paymentCode, 40),
+                Pad(unblockMethod, 1),
+                Pad(dealerCode, 20),
+                Pad("", 24),
+                Pad(price, 10, '0', true),
+                Pad("", 31),
+                Pad(ownerCode, 4),
+                Pad("", 51)
+            );
+
+            // Append with LF explicitly
+            outputBuilder.Append(line).Append('\n');
+        }
+
+        //  Normalize line endings to LF
+        string finalOutput = outputBuilder.ToString()
+                                          .Replace("\r\n", "\n")
+                                          .Replace("\r", "\n");
+
+        // Get connection string from environment settings
+        string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+
+        // Connect to Blob container
+        var blobClient = new BlobContainerClient(connectionString, input.Container);
+        await blobClient.CreateIfNotExistsAsync(); // Create container if not exists
+
+        // Upload the file content as a Blob
+        var blob = blobClient.GetBlobClient(input.TxtFileBlobName);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(finalOutput));
+        await blob.UploadAsync(stream, overwrite: true);
+
+        // Return success
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        await response.WriteStringAsync($"File uploaded to '{input.Container}/{input.TxtFileBlobName}' for brand '{input.Brand}'.");
+        return response;
+    }
+}

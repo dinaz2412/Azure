@@ -1,0 +1,114 @@
+using System.IO.Compression;
+using System.Text;
+using System.Text.Json;
+using Azure.Core;
+using Azure.Identity;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+using System.Net.Http.Headers;
+
+namespace ATF_ExtractZipFileFromSharePointFunction;
+
+public class ATFExtractZipFromSharePointFunction
+{
+    private readonly ILogger<ATFExtractZipFromSharePointFunction> _logger;
+    private readonly HttpClient _httpClient;
+
+    public ATFExtractZipFromSharePointFunction(ILogger<ATFExtractZipFromSharePointFunction> logger)
+    {
+        _logger = logger;
+        _httpClient = new HttpClient();
+    }
+
+    [Function("ExtractZipFromSharePoint")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+    {
+        var requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+        var payload = JsonSerializer.Deserialize<RequestPayload>(requestBody, new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true
+        });
+
+        if (string.IsNullOrWhiteSpace(payload?.SharePointUrl))
+        {
+            var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await badRequest.WriteStringAsync("'sharePointUrl' must be provided.");
+            return badRequest;
+        }
+
+        try
+        {
+            // 1. Get access token via Managed Identity
+            var credential = new DefaultAzureCredential();
+            string[] scopes = { "https://graph.microsoft.com/.default" };
+            var token = await credential.GetTokenAsync(new TokenRequestContext(scopes));
+            string accessToken = token.Token;
+
+            // 2. Download file from SharePoint using Microsoft Graph
+            var request = new HttpRequestMessage(HttpMethod.Get, payload.SharePointUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            using var response = await _httpClient.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorResp = req.CreateResponse(System.Net.HttpStatusCode.BadGateway);
+                await errorResp.WriteStringAsync($"Failed to download file from SharePoint. Status: {response.StatusCode}");
+                return errorResp;
+            }
+
+            using var zipStream = new MemoryStream();
+            await response.Content.CopyToAsync(zipStream);
+            zipStream.Position = 0;
+
+            var extractedFiles = new List<FileResult>();
+
+            // 3. Extract XML files (skip manifest & header)
+            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
+            {
+                foreach (var entry in archive.Entries)
+                {
+                    if (entry.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) &&
+                        !entry.FullName.Contains("manifest", StringComparison.OrdinalIgnoreCase) &&
+                        !entry.FullName.Contains("packageheader", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using var reader = new StreamReader(entry.Open(), Encoding.UTF8);
+                        string content = await reader.ReadToEndAsync();
+
+                        extractedFiles.Add(new FileResult
+                        {
+                            FileName = entry.FullName,
+                            Content = content
+                        });
+                    }
+                }
+            }
+
+            // 4. Return JSON array with FileName + Content
+            var okResp = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            okResp.Headers.Add("Content-Type", "application/json");
+
+            await okResp.WriteStringAsync(JsonSerializer.Serialize(extractedFiles));
+            return okResp;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error extracting ZIP file from SharePoint.");
+            var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Error extracting ZIP file.");
+            return error;
+        }
+    }
+
+    public class RequestPayload
+    {
+        public string SharePointUrl { get; set; } = string.Empty;
+    }
+
+    public class FileResult
+    {
+        public string FileName { get; set; } = string.Empty;
+        public string Content { get; set; } = string.Empty;
+    }
+}

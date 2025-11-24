@@ -1,0 +1,352 @@
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+using System.Xml.Linq;
+
+using Azure.Storage.Blobs;
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+
+using Newtonsoft.Json;
+
+
+namespace ATF_3475_3546_ExtractRFIAZipFile;
+
+public class ATFThreePLArceseTransformationFunction
+{
+    private readonly ILogger _logger;
+
+    public ATFThreePLArceseTransformationFunction(ILoggerFactory loggerFactory)
+    {
+        _logger = loggerFactory.CreateLogger<ATFThreePLArceseTransformationFunction>();
+    }
+
+    public class RequestModel
+    {
+        public string XmlContent { get; set; }
+        public string Container { get; set; }
+        public string TxtFileBlobName { get; set; }
+    }
+
+    public class SalesOrderAttachment
+    {
+        public string SalesOrderNumber { get; set; }
+        public long RecId { get; set; }
+        public int Numerico { get; set; }
+        public XElement XmlNode { get; set; }
+    }
+
+    [Function("ATFArcese3PLFileTransformation")]
+    public async Task<HttpResponseData> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+    {
+        _logger.LogInformation("Received XML for Arcese TXT conversion.");
+
+        string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+        var data = JsonConvert.DeserializeObject<RequestModel>(requestBody);
+
+        if (string.IsNullOrWhiteSpace(data?.XmlContent))
+        {
+            var badResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+            await badResponse.WriteStringAsync("XmlContent is required.");
+            return badResponse;
+        }
+
+        var xml = XDocument.Parse(data.XmlContent);
+        var pickingHeaders = xml.Descendants("ATFPICKINGLISTHEADERDATAENTITY").ToList();
+        if (!pickingHeaders.Any())
+        {
+            _logger.LogWarning("No ATFPICKINGLISTHEADERDATAENTITY found. Skipping file creation.");
+
+            var noDataResponse = req.CreateResponse(System.Net.HttpStatusCode.NoContent);
+            await noDataResponse.WriteStringAsync("No picking headers found. File creation skipped.");
+            return noDataResponse;
+        }
+
+        var sb = new StringBuilder();
+
+        // ----- START LINE:
+        string lineStart = string.Concat(Pad("CTR", 5) +
+                                    Pad("360", 10) +
+                                    Pad("", 100));
+        sb.AppendLine(lineStart);
+
+        // ----- PICKING HEADER
+        foreach (var header in xml.Descendants("ATFPICKINGLISTHEADERDATAENTITY"))
+        {
+
+            var salesHeader = header.Element("ATFSALESORDERHEADERV4ENTITY");
+            if (salesHeader == null) continue;
+
+            string pickingId = header.Element("PICKINGROUTEID")?.Value;
+            string createdDate = header.Element("CREATEDDATETIME")?.Value ?? System.DateTime.UtcNow.ToString("yyyy-MM-dd");
+
+            string salesPoolId = salesHeader.Element("SALESORDERPOOLID")?.Value;
+            string invoiceAccount = salesHeader.Element("INVOICECUSTOMERACCOUNTNUMBER")?.Value;
+            string invoiceName = salesHeader.Element("ATFSOINVOICENAME")?.Value;
+            string invoiceStreet = salesHeader.Element("INVOICEADDRESSSTREET")?.Value;
+
+            string invoiceStreet2 = string.Empty;
+            if (invoiceStreet.Length > 50)
+            {
+                invoiceStreet2 = invoiceStreet.Substring(50);
+            }
+
+            string invoicePhone = salesHeader.Element("ATFINVOICEACCPRIMARYPHN")?.Value;
+            string invoiceCity = salesHeader.Element("INVOICEADDRESSCITY")?.Value;
+            string invoiceCounty = salesHeader.Element("INVOICEADDRESSCOUNTYID")?.Value;
+            string invoiceZip = salesHeader.Element("INVOICEADDRESSZIPCODE")?.Value;
+            string invoiceCountry = salesHeader.Element("INVOICEADDRESSCOUNTRYREGIONID")?.Value;
+
+
+            string deliveryAccount = salesHeader.Element("ORDERINGCUSTOMERACCOUNTNUMBER")?.Value;
+            string deliveryLocation = salesHeader.Element("DELIVERYADDRESSLOCATIONID")?.Value;
+            string deliveryCode = $"{deliveryAccount}-{deliveryLocation}";
+
+            string deliveryName = salesHeader.Element("DELIVERYADDRESSNAME")?.Value;
+            string deliveryStreet = salesHeader.Element("DELIVERYADDRESSSTREET")?.Value;
+
+            string deliveryStreet2 = string.Empty;
+
+            if (deliveryStreet.Length > 50)
+            {
+                deliveryStreet2 = deliveryStreet.Substring(50);
+            }
+            string deliveryPhone = salesHeader.Element("ATFDELIVERYACCPRIMARYPHN")?.Value;
+            string deliveryCity = salesHeader.Element("DELIVERYADDRESSCITY")?.Value;
+            string deliveryZip = salesHeader.Element("DELIVERYADDRESSZIPCODE")?.Value;
+
+            string deliveryProvince = salesHeader.Element("DELIVERYADDRESSCOUNTYID")?.Value;
+            string deliveryCountry = salesHeader.Element("DELIVERYADDRESSCOUNTRYREGIONID")?.Value;
+
+
+            string vettoreCode = salesHeader.Element("SHIPPINGCARRIERID")?.Value;
+            string vettoreName = salesHeader.Element("ATFSHIPPINGCARRIERNAME")?.Value;
+            string vettoreStreet = salesHeader.Element("ATFCARRIERSTREET")?.Value;
+            string vettorePhone = salesHeader.Element("ATFCARRIERPHONE")?.Value;
+            string vettoreLocalita = salesHeader.Element("ATFCARRIERCITY")?.Value;
+
+            string vettoreProvincia = salesHeader.Element("ATFCARRIERCOUNTY")?.Value;
+            string vettoreNazione = salesHeader.Element("ATFCARRIERCOUNTRY")?.Value;
+
+            string deliveryReasonCode = salesHeader.Element("DELIVERYREASONCODE")?.Value;
+            string deliveryReasonCodeName = salesHeader.Element("ATFDELIVERYREASONCODE")?.Value;
+            string deliveryTermCode = salesHeader.Element("DELIVERYTERMSCODE")?.Value;
+            string deliveryTermCodeName = salesHeader.Element("ATFDELIVERYTERMSCODE")?.Value;
+            string salesOrder = salesHeader.Element("SALESORDERNUMBER")?.Value;
+
+            string deliveryAddCountryId = salesHeader.Element("DELIVERYADDRESSCOUNTRYREGIONID")?.Value;
+            string atfLegalEntityCountryId = salesHeader.Element("ATFLEGALENTITYCOUNTRY")?.Value;
+            string checkCountry = string.Equals(deliveryAddCountryId, atfLegalEntityCountryId, StringComparison.OrdinalIgnoreCase) ? "S" : "N";
+            string cashOnDelivery = (salesHeader.Element("ATFCASHONDELIVERYFOR3PL").Value == "true") ? "S" : "N";
+            string totalAmount = salesHeader.Element("ORDERTOTALAMOUNT")?.Value;
+            string currencyCode = salesHeader.Element("CURRENCYCODE")?.Value;
+            string invoiceAccEmail = salesHeader.Element("ATFINVOICEACCEMAILS")?.Value;
+            string deliveryAccEmail = salesHeader.Element("ATFDELIVERYACCEMAILS")?.Value;
+            string taxExemptNumber = salesHeader.Element("TAXEXEMPTNUMBER")?.Value;
+
+            // Construct "T" line (header)
+            string headerLine = string.Concat(Pad("T", 5) +
+                                                Pad(pickingId, 15) +
+                                                Pad(createdDate, 19) +
+                                                Pad(salesPoolId, 5) +                 // Ordine Tipo
+                                                Pad("", 7) +                         // Trasporto Anno
+                                                Pad("", 15) +                        // Trasporto Numero
+                                                Pad("", 3) +                         // Priorita
+                                                Pad("", 3) +                         // Modalita gestione codice
+                                                Pad("C", 3) +                        // Intestatario Tipo
+                                                Pad(invoiceAccount, 20) +            //INTESTATARIO_CODICE
+                                                Pad(invoiceName, 50) +               //INTESTATARIO_RAGIONE_SOCIALE
+                                                Pad(invoiceStreet, 50) +            //INTESTATARIO_INDIRIZZO
+                                                Pad(invoicePhone, 20) +
+                                                Pad(invoiceCity, 50) +
+                                                Pad(invoiceCounty, 10) +
+                                                Pad(invoiceZip, 15) +
+                                                Pad(invoiceCountry, 10) +
+                                                Pad("D", 3) +                        // Destinatario Tipo
+                                                Pad(deliveryCode, 20) +
+                                                Pad(deliveryName, 50) +
+                                                Pad(deliveryStreet, 50) +
+                                                Pad(deliveryPhone, 20) +
+                                                Pad(deliveryCity, 50) +
+                                                Pad(deliveryZip, 15) +
+                                                Pad(deliveryProvince, 10) +
+                                                Pad(deliveryCountry, 10) +
+                                                Pad("", 3) +                         // Deposito Cedente Tipo
+                                                Pad("V", 3) +                        // Vettore Tipo
+                                                Pad(vettoreCode, 20) +
+                                                Pad(vettoreName, 50) +
+                                                Pad(vettoreStreet, 50) +
+                                                Pad(vettorePhone, 20) +
+                                                Pad(vettoreLocalita, 50) +
+                                                Pad(vettoreProvincia, 10) +
+                                                Pad(vettoreNazione, 10) +
+                                                Pad("", 5) +                      //CONDIZIONE_TRASPORTO_CODICE
+                                                Pad("", 50) +                     //CONDIZIONE_TRASPORTO_DESCRIZIONE
+                                                Pad(deliveryReasonCode, 5) +
+                                                Pad(deliveryReasonCodeName, 50) +
+                                                Pad(deliveryTermCode, 5) +
+                                                Pad(deliveryTermCodeName, 50) +
+                                                Pad("", 10) +                    //INSTRADAMENTO
+                                                Pad("", 20) +                    //ORDINE_TIPO_DESCRIZIONE
+                                                Pad("", 5) +                    //TRASPORTO_TIPO
+                                                Pad("", 5) +                    //PESO_UNITA_MISURA
+                                                Pad("", 10) +                    //PESO_LORDO_TOTALE
+                                                Pad("", 10) +                    //PESO_NETTO_TOTALE
+                                                Pad("", 5) +                    //VOLUME_UNITA_MISURA
+                                                Pad("", 16) +                    //VOLUME_TOTALE
+                                                Pad("N", 1) +
+                                                Pad(checkCountry, 1) +        // check country with legal entity country
+                                                Pad(cashOnDelivery, 1) +
+                                                Pad(totalAmount, 13) +
+                                                Pad(currencyCode, 5) +
+                                                Pad("N", 1) +
+                                                Pad("", 13) +                            //IMPORTO_ASSICURAZIONE
+                                                Pad("", 5) +                            //VALUTA_IMPORTO_ASSICURAZIONE
+                                                Pad(totalAmount, 13) +
+                                                Pad(currencyCode, 5) +
+                                                Pad(invoiceAccEmail, 80) +
+                                                Pad(deliveryAccEmail, 80) +
+                                                Pad(invoiceStreet2, 50) +                 //TODO
+                                                Pad(deliveryStreet2, 50) +                 //TODO
+                                                Pad("", 20) +                       //INTESTATARIO_ISCRIZIONE_ALBO
+                                                Pad("", 20) +                   //DESTINATARIO_ISCRIZIONE_ALBO
+                                                Pad("", 20) +                   //VETTORE_ISCRIZIONE_ALBO
+                                                Pad(taxExemptNumber, 20) +
+                                                Pad("", 20) +
+                                                Pad("", 20)
+            );
+            sb.AppendLine(headerLine);
+
+
+            // ----- PICKING LIST LINE
+            foreach (var line in header.Elements("ATFPICKINGLISTLINESDATAENTITY"))
+            {
+                string lineNumber = line.Element("ATFLINENUM")?.Value;
+                string itemId = line.Element("ITEMID")?.Value;
+                string lineDesc = line.Element("ATFLINEDESCRIPTION")?.Value;
+                string uom = line.Element("ATFINVENTORYUOM")?.Value;
+                string qty = line.Element("QTY")?.Value;
+
+                string orderCreated = salesHeader.Element("ORDERCREATIONDATETIME")?.Value;
+                string custReqNo = salesHeader.Element("CUSTOMERREQUISITIONNUMBER")?.Value;
+
+                string picklistLine = String.Concat(Pad("D", 5) +                       // TIPO_RIGA default "D"
+                                                Pad(pickingId, 15) +                    // ORDINE_NUMERO
+                                                Pad(createdDate, 19) +                  // ORDINE_DATA
+                                                Pad(lineNumber, 6) +                    // RIGA
+                                                Pad(itemId, 35) +                       // ARTICOLO
+                                                Pad(lineDesc, 50) +                     // DESCRIZIONE
+                                                Pad(uom, 5) +                           // UNITA_MISURA
+                                                Pad(qty, 11, '0', true) +               // QUANTITA_ORDINATA (right align numeric)
+                                                Pad("", 11) +                           // PESO_NETTO_UNITARIO
+                                                Pad("", 11) +                           // PESO_LORDO_UNITARIO
+                                                Pad("", 11) +                           // PESO_NETTO_TOTALE
+                                                Pad("", 11) +                           // PESO_LORDO_TOTALE
+                                                Pad("", 17) +                           // PREZZO_UNITARIO
+                                                Pad("", 5) +                            // PESO_UNITA_MISURA
+                                                Pad("", 16) +                           // VOLUME_UNITARIO
+                                                Pad("", 16) +                           // VOLUME_TOTALE
+                                                Pad("", 5) +                            // VOLUME_UNITA_MISURA
+                                                Pad("", 20) +                           // CODICE_EAN
+                                                Pad(salesOrder, 15) +                   // RIFERIMENTO_CUSTOMER_NUMERO
+                                                Pad(orderCreated, 19) +                 // RIFERIMENTO_CUSTOMER_DATA
+                                                Pad("", 6) +                            // RIFERIMENTO_CUSTOMER_RIGA
+                                                Pad(custReqNo, 35) +                    // ORDINE_CUSTOMER_NUMERO
+                                                Pad("", 19) +                           // ORDINE_CUSTOMER_DATA
+                                                Pad("", 20) +                           // LOTTO
+                                                Pad("", 20) +                           // MATRICOLA
+                                                Pad("", 20) +                           // LEGAME_PRELIEVO
+                                                Pad("", 4) +                            // RIGA_CATEGORIA
+                                                Pad("", 5)                              // ORDINE_CUSTOMER_TIPO);
+                );
+                sb.AppendLine(picklistLine);
+            }
+
+            var headerAttachments = salesHeader.Elements("ATFSALESORDERHEADERDOCUMENTATTACHMENTV2ENTITY").ToList();
+
+            var numberedHeaderAttachments = headerAttachments
+                .OrderBy(e => long.Parse((string)e.Element("ATFLINENUMERICO") ?? "0")) // order by RecId
+                .Select((e, idx) => new { Entity = e, Numerico = idx + 1 })
+                .ToList();
+
+            foreach (var item in numberedHeaderAttachments)
+            {
+                sb.AppendLine(
+                    Pad("NT", 5) +
+                    Pad(pickingId, 20) +
+                    Pad(createdDate, 19) +
+                    Pad(item.Numerico.ToString(), 6, '0', true) +   // progressive per header
+                    Pad(item.Entity.Element("NOTES")?.Value, 200) +
+                    Pad(item.Entity.Element("DOCUMENTATTACHMENTTYPECODE")?.Value, 4)
+                );
+            }
+
+            foreach (var soLine in salesHeader.Descendants("SALESORDERLINEV3ENTITY"))
+            {
+
+                var lineAttachments = soLine.Descendants("ATFSALESORDERLINEDOCUMENTATTACHMENTV2ENTITY").ToList();
+                // string lineNo = lineAttachments.Element("ATFPICKINGLINENUM")?.Value;
+                var numberedLineAttachments = lineAttachments
+                        .OrderBy(a => long.Parse((string)a.Element("ATFLINENUMERICO") ?? "0")) // order by RecId
+                        .Select((a, idx) => new { Entity = a, Numerico = idx + 1 })
+                        .ToList();
+
+                foreach (var item in numberedLineAttachments)
+                {
+
+                    sb.AppendLine(
+                            Pad("ND", 5) +
+                            Pad(pickingId, 20) +
+                            Pad(createdDate, 19) +
+                            Pad(item.Entity.Element("ATFPICKINGLINENUM")?.Value, 6) +
+                            Pad(item.Numerico.ToString(), 6, '0', true) +   // progressive per line
+                            Pad(item.Entity.Element("NOTES")?.Value, 200) +
+                            Pad(item.Entity.Element("DOCUMENTATTACHMENTTYPECODE")?.Value, 4)
+                        );
+                }
+            }
+
+
+
+        }
+        sb.AppendLine(Pad("END", 5));
+
+        string resultText = sb.ToString();
+
+        // ----- Write to Blob Storage if container and filename are provided -----
+        if (!string.IsNullOrWhiteSpace(data.Container) && !string.IsNullOrWhiteSpace(data.TxtFileBlobName))
+        {
+            string connectionString = System.Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            var blobClient = new BlobClient(connectionString, data.Container, data.TxtFileBlobName);
+
+            using var ms = new MemoryStream(Encoding.UTF8.GetBytes(resultText));
+            await blobClient.UploadAsync(ms, overwrite: true);
+
+            _logger.LogInformation($"File uploaded to blob: {data.Container}/{data.TxtFileBlobName}");
+        }
+
+        var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+        response.Headers.Add("Content-Type", "text/plain; charset=utf-8");
+        await response.WriteStringAsync(resultText);
+
+        return response;
+    }
+
+    // Fixed-width Pading utility
+    // Pad function to handle positional Pad
+    string Pad(string value, int length, char padChar = ' ', bool rightAlign = false)
+    {
+        // 1. Handle nulls and sanitize input
+        value = value ?? "";
+        value = value.Replace("\r", " ").Replace("\n", " ").Trim();
+
+        // 2. Apply padding
+        value = rightAlign ? value.PadLeft(length, padChar) : value.PadRight(length, padChar);
+
+        // 3. Ensure max length
+        return value.Length > length ? value.Substring(0, length) : value;
+    }
+}

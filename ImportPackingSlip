@@ -1,0 +1,107 @@
+using Azure.Storage.Blobs;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+using ATF_3475_3546_ExtractRFIAZipFile.ATFArceseImportHelpers;
+
+namespace ATF_3475_3546_ExtractRFIAZipFile
+{
+    public class ATF3PLImportPackingSlipTransformationFunction
+    {
+        private readonly ILogger<ATF3PLImportPackingSlipTransformationFunction> _logger;
+
+        public ATF3PLImportPackingSlipTransformationFunction(ILogger<ATF3PLImportPackingSlipTransformationFunction> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("ATF3PLImportPackingSlipTransformation")]
+        public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+        {
+            _logger.LogInformation("ATF 3PL import transformation request received.");
+
+            string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+            var input = JsonSerializer.Deserialize<DmfRequest>(requestBody);
+
+            if (input == null || string.IsNullOrEmpty(input.FilePath) || string.IsNullOrEmpty(input.EntityName) || string.IsNullOrEmpty(input.ThreePLOperator))
+            {
+                var badResponse = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                await badResponse.WriteStringAsync("Please provide FilePath, EntityName, and ThreePLOperator.");
+                return badResponse;
+            }
+
+            string blobContainerName = string.IsNullOrEmpty(input.OutputContainer)
+                ? "dynamics365fodataexchange"
+                : input.OutputContainer;
+
+            var blobService = new BlobServiceClient(Environment.GetEnvironmentVariable("AzureWebJobsStorage"));
+            var containerClient = blobService.GetBlobContainerClient(blobContainerName);
+            await containerClient.CreateIfNotExistsAsync();
+
+            var txtBlobClient = containerClient.GetBlobClient(input.FilePath);
+            if (!await txtBlobClient.ExistsAsync())
+            {
+                var error = req.CreateResponse(System.Net.HttpStatusCode.NotFound);
+                await error.WriteStringAsync($"Source file not found: {input.FilePath}");
+                return error;
+            }
+
+            string txtContent;
+            using (var stream = await txtBlobClient.OpenReadAsync())
+            using (var reader = new StreamReader(stream))
+                txtContent = await reader.ReadToEndAsync();
+
+            try
+            {
+                // --- Convert TXT to XML using the provided 3PL operator ---
+                var xmlDataStream = ArcesePositionalParser.ConvertPositionalTxtToXmlStream(txtContent, input.ThreePLOperator);
+
+
+                // --- Convert stream to string for reuse ---
+                string dataXml;
+                using (var reader = new StreamReader(xmlDataStream, Encoding.UTF8, true, 1024, leaveOpen: true))
+                {
+                    dataXml = await reader.ReadToEndAsync();
+                    xmlDataStream.Position = 0; // Reset for upload
+                }
+
+                // --- Upload Data XML ---
+                string dataBlobName = $"{input.OutputPath.TrimEnd('/')}/{input.EntityName}_{Guid.NewGuid():N}.xml";
+                var dataBlob = containerClient.GetBlobClient(dataBlobName);
+                await dataBlob.UploadAsync(xmlDataStream, overwrite: true);
+
+                var okResponse = req.CreateResponse(System.Net.HttpStatusCode.OK);
+                await okResponse.WriteAsJsonAsync(new
+                {
+                    Message = "XML file created successfully",
+                    Container = blobContainerName,
+                    BlobName = dataBlobName
+                });
+
+                return okResponse;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error processing TXT file.");
+                var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+                await error.WriteStringAsync($"Error processing TXT file: {ex.Message}");
+                return error;
+            }
+        }
+
+        public class DmfRequest
+        {
+            public string FilePath { get; set; }        // Blob path of source TXT
+            public string EntityName { get; set; }      // DMF entity
+            public string OutputContainer { get; set; } // Optional
+            public string OutputPath { get; set; }      // Folder for output files
+            public string ThreePLOperator { get; set; } // 3PL operator to be used
+        }
+    }
+}

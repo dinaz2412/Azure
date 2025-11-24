@@ -1,0 +1,299 @@
+namespace ATF_3475_3546_ExtractRFIAZipFile.ATFArceseImportHelpers
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Globalization;
+    using System.IO;
+    using System.Linq;
+    using System.Text;
+    using System.Xml.Linq;
+
+    public static class ArcesePositionalParser
+    {
+        /// <summary>
+        /// Converts Arcese positional TXT to XML stream.
+        /// </summary>
+        public static MemoryStream ConvertPositionalTxtToXmlStream(string fileContent, string threePLOperator)
+        {
+            if (string.IsNullOrWhiteSpace(fileContent))
+                throw new Exception("Input TXT is empty");
+
+            // Keep only header (T) and detail (D) lines
+            var lines = fileContent
+                .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(l => l.StartsWith("T") || l.StartsWith("D"))
+                .ToList();
+
+            if (lines.Count == 0)
+                throw new Exception("No valid T or D lines found");
+
+            // --- Safe helpers ---
+            string SafeSubstring(string input, int start, int length)
+            {
+                if (string.IsNullOrEmpty(input) || start <= 0 || start > input.Length)
+                    return string.Empty;
+
+                int safeLen = Math.Min(length, input.Length - (start - 1));
+                return input.Substring(start - 1, safeLen).Trim();
+            }
+
+            decimal SafeDecimal(string s) => decimal.TryParse(s, out var val) ? val : 0;
+            int SafeInt(string s) => int.TryParse(s, out var val) ? val : 0;
+
+            DateTime SafeDate(string s)
+            {
+                if (string.IsNullOrWhiteSpace(s))
+                    return DateTime.MinValue;
+
+                s = s.Trim();
+
+                string[] formats =
+                {
+                    "yyyy-MM-dd HH:mm:ss",
+                    "yyyy-MM-dd",
+                    "dd-MM-yyyy HH:mm:ss",
+                    "dd-MM-yyyy"
+                };
+
+                if (DateTime.TryParseExact(s, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+                    return dt;
+
+                if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))
+                    return dt;
+
+                Console.WriteLine($"Could not parse date: '{s}'");
+                return DateTime.MinValue;
+            }
+
+
+            string ExtractAccount(string input)
+            {
+                if (string.IsNullOrWhiteSpace(input)) return string.Empty;
+
+                var parts = input.Split(new[] { '-', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                return parts.Length > 0 ? parts[0] : string.Empty;
+            }
+
+            // --- Parse header (T line) ---
+            var headerLine = lines.First(l => l.StartsWith("T"));
+            var header = new ShippingHeader
+            {
+                EXTPACKINGSLIPNUM = SafeInt(SafeSubstring(headerLine, 2, 10)),        // After 'T'
+                DOCUMENTDATE = SafeDate(SafeSubstring(headerLine, 12, 19)),          // ✅ Fixed start position
+                ACCOUNT = ExtractAccount(SafeSubstring(headerLine, 35, 20)),
+                DELIVERYADDRESSNAME = SafeSubstring(headerLine, 55, 49),
+                NETWEIGHT = SafeDecimal(SafeSubstring(headerLine, 641, 10)),
+                GROSSWEIGHT = SafeDecimal(SafeSubstring(headerLine, 652, 10)),
+                VOLUME = SafeDecimal(SafeSubstring(headerLine, 663, 10)),
+                WEIGHTUOM = SafeSubstring(headerLine, 674, 4),
+                VOLUMEUOM = SafeSubstring(headerLine, 679, 4),
+                PACKAGES = SafeInt(SafeSubstring(headerLine, 684, 3)),
+                TRANSPORTREASON = SafeSubstring(headerLine, 688, 49)
+            };
+
+            // --- Parse detail lines (D lines) ---
+            var lineRecords = new List<ShippingLine>();
+            foreach (var l in lines.Where(l => l.StartsWith("D")))
+            {
+                lineRecords.Add(new ShippingLine
+                {
+                    PICKINGLIST = SafeSubstring(l, 17, 29),
+                    PICKINGLISTLINE = SafeSubstring(l, 66, 6),
+                    DOCUMENTDATE = SafeDate(SafeSubstring(l, 29, 19)),              // ✅ Fixed start position
+                    ITEMID = SafeSubstring(l, 72, 34),
+                    ORDEREDQTY = SafeDecimal(SafeSubstring(l, 152, 10)),
+                    SHIPPEDQTY = SafeDecimal(SafeSubstring(l, 163, 10)),
+                    DEVICEID = SafeSubstring(l, 127, 19),
+                    THREEPLOPERATOR = threePLOperator
+                });
+            }
+
+            // --- Generate XML ---
+            var root = new XElement("Document");
+            foreach (var line in lineRecords)
+            {
+                var dateToUse = line.DOCUMENTDATE == DateTime.MinValue
+                    ? header.DOCUMENTDATE
+                    : line.DOCUMENTDATE;
+
+                var entity = new XElement("ATF3PLSHIPPINGDETAILSENTITY",
+                    new XElement("THREEPLOPERATOR", line.THREEPLOPERATOR),
+                    new XElement("EXTPACKINGSLIPNUM", header.EXTPACKINGSLIPNUM),
+                    new XElement("SHIPDATE", dateToUse.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+                    new XElement("PICKINGLIST", line.PICKINGLIST),
+                    new XElement("PICKINGLISTLINE", line.PICKINGLISTLINE),
+                    new XElement("ACCOUNT", header.ACCOUNT),
+                    new XElement("DELIVERYADDRESSNAME", header.DELIVERYADDRESSNAME),
+                    new XElement("DEVICEID", line.DEVICEID),
+                    new XElement("DOCUMENTDATE", dateToUse.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)),
+                    new XElement("DOCUMENTDATE", line.DOCUMENTDATE == DateTime.MinValue ? header.DOCUMENTDATE.ToString("yyyy-MM-dd") : line.DOCUMENTDATE.ToString("yyyy-MM-dd")),
+                    new XElement("ERRORMESSAGE", string.Empty),
+                    new XElement("GROSSWEIGHT", header.GROSSWEIGHT),
+                    new XElement("ITEMID", line.ITEMID),
+                    new XElement("MODEOFDELIVERY", string.Empty),
+                    new XElement("NETWEIGHT", header.NETWEIGHT),
+                    new XElement("ORDEREDQTY", line.ORDEREDQTY),
+                    new XElement("PACKAGES", header.PACKAGES),
+                    new XElement("PACKINGSLIPID", string.Empty),
+                    new XElement("SHIPPEDQTY", line.SHIPPEDQTY),
+                    new XElement("TRANSPORTREASON", header.TRANSPORTREASON),
+                    new XElement("VOLUME", header.VOLUME),
+                    new XElement("VOLUMEUOM", header.VOLUMEUOM),
+                    new XElement("WEIGHTUOM", header.WEIGHTUOM)
+                );
+
+                root.Add(entity);
+            }
+
+            var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root);
+            var bytes = Encoding.UTF8.GetBytes(doc.ToString());
+            return new MemoryStream(bytes);
+        }
+    }
+
+    // --- Models ---
+    public class ShippingHeader
+    {
+        public string ACCOUNT { get; set; }
+        public string DELIVERYADDRESSNAME { get; set; }
+        public DateTime DOCUMENTDATE { get; set; }
+        public int EXTPACKINGSLIPNUM { get; set; }
+        public decimal NETWEIGHT { get; set; }
+        public decimal GROSSWEIGHT { get; set; }
+        public decimal VOLUME { get; set; }
+        public string WEIGHTUOM { get; set; }
+        public string VOLUMEUOM { get; set; }
+        public int PACKAGES { get; set; }
+        public string TRANSPORTREASON { get; set; }
+    }
+
+    public class ShippingLine
+    {
+        public string PICKINGLIST { get; set; }
+        public string PICKINGLISTLINE { get; set; }
+        public string ITEMID { get; set; }
+        public string DEVICEID { get; set; }
+        public decimal ORDEREDQTY { get; set; }
+        public decimal SHIPPEDQTY { get; set; }
+        public DateTime DOCUMENTDATE { get; set; }
+        public string THREEPLOPERATOR { get; set; }
+    }
+}
+
+//dynamic manifest build
+namespace ATF_3475_3546_ExtractRFIAZipFile.ATFArceseImportHelpers
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using System.Text;
+    using System.Threading.Tasks;
+    using System.Xml.Linq;
+
+    internal class DMFManifestBuilder
+    {
+        public class FieldMapping
+        {
+            public string SourceField { get; set; }   // Field from TXT
+            public string TargetField { get; set; }   // Field in D365 entity
+        }
+
+        // Builds a DMF manifest XML dynamically
+        public static class DmfManifestBuilder
+        {
+            public static string CreateDmfManifest(
+                string definitionGroupName,
+                string entityName,
+                string inputFileName,
+                IEnumerable<FieldMapping> fieldMappings)
+            {
+                // Define XML namespaces that D365 expects
+                XNamespace ns = "http://schemas.microsoft.com/dynamics/2015/01/DataManagement";
+                XNamespace iNs = "http://www.w3.org/2001/XMLSchema-instance";
+
+                // Build the field mappings XML structure
+                var entityMapListElement = new XElement(ns + "EntityMapList");
+                int idx = 0;
+                foreach (var map in fieldMappings)
+                {
+                    entityMapListElement.Add(
+                        new XElement(ns + "EntityMap",
+                            new XElement(ns + "ArrayIndex", idx),
+                            new XElement(ns + "EntityField", map.TargetField),
+                            new XElement(ns + "EntityFieldConversionList", new XAttribute(iNs + "nil", "true")),
+                            new XElement(ns + "IsAutoDefault", "false"),
+                            new XElement(ns + "IsAutoGenerated", "false"),
+                            new XElement(ns + "IsDefaultValueEqualNull", "false"),
+                            new XElement(ns + "UseTextQualifier", "false"),
+                            new XElement(ns + "XMLField", map.SourceField)
+                        )
+                    );
+                    idx++;
+                }
+
+                // Now build the manifest body XML
+                var root = new XElement(ns + "DataManagementPackageManifest",
+                    new XAttribute(XNamespace.Xmlns + "i", iNs.NamespaceName),
+                    new XElement(ns + "DefinitionGroupName", definitionGroupName),
+                    new XElement(ns + "Description", string.Empty),
+                    new XElement(ns + "PackageEntityList",
+                        new XElement(ns + "DataManagementPackageEntityData",
+                            new XElement(ns + "DefaultRefreshType", "FullPush"),
+                            new XElement(ns + "Disable", "false"),
+                            entityMapListElement,
+                            new XElement(ns + "EntityName", definitionGroupName),
+                            new XElement(ns + "InputFilePath", inputFileName),
+                            new XElement(ns + "SourceFormat", "XML-Element"),
+                            new XElement(ns + "TargetEntity", entityName),
+                            new XElement(ns + "ValidationStatus", "Yes")
+                        )
+                    ),
+                    new XElement(ns + "ProjectCategory", "0"),
+                    new XElement(ns + "RulesData", new XAttribute(iNs + "nil", "true"))
+                );
+
+                // Wrap it in an XML document
+                var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root);
+                return doc.ToString();
+            }
+        }
+    }
+}
+
+// dynamic package builder
+namespace ATF_3475_3546_ExtractRFIAZipFile.ATFArceseImportHelpers
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using System.Text;
+    using System.Threading.Tasks;
+    using System.Xml.Linq;
+
+    internal static class DMFPackageHeaderBuilder
+    {
+        /// <summary>
+        /// Creates a valid DMF PackageHeader.xml (same structure D365 FO exports)
+        /// </summary>
+        /// <param name="description">Short description (usually your entity or export name)</param>
+        /// <returns>XML string matching D365 DMF format</returns>
+        public static string CreateDmfPackageHeader(string description)
+        {
+            XNamespace ns = "http://schemas.microsoft.com/dynamics/2015/01/DataManagement";
+            XNamespace iNs = "http://www.w3.org/2001/XMLSchema-instance";
+
+            var root = new XElement(ns + "DataManagementPackageHeader",
+                new XAttribute(XNamespace.Xmlns + "i", iNs.NamespaceName),
+                new XElement(ns + "Description", description ?? string.Empty),
+                new XElement(ns + "ManifestType",
+                    "Microsoft.Dynamics.AX.Framework.Tools.DataManagement.Serialization.DataManagementPackageManifest"),
+                new XElement(ns + "PackageType", "DefinitionGroup"),
+                new XElement(ns + "PackageVersion", "2")
+            );
+
+            var doc = new XDocument(new XDeclaration("1.0", "utf-8", "yes"), root);
+            return doc.ToString();
+        }
+    }
+}
+

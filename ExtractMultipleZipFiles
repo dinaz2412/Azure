@@ -1,0 +1,152 @@
+using Azure.Storage.Blobs;
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+
+using System.IO.Compression;
+using System.Text;
+using System.Text.Json;
+
+namespace ATF_3475_3546_ExtractRFIAZipFile
+{
+    public class ATFExtractMultipleZipFilesFunction
+    {
+        private readonly ILogger<ATFExtractMultipleZipFilesFunction> _logger;
+
+        public ATFExtractMultipleZipFilesFunction(ILogger<ATFExtractMultipleZipFilesFunction> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("ExtractZipMultipleFiles")]
+        public async Task<HttpResponseData> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+        {
+            var requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+
+            RequestPayload payload;
+            try
+            {
+                payload = JsonSerializer.Deserialize<RequestPayload>(requestBody, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Invalid request body.");
+                var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                await badRequest.WriteStringAsync("Invalid JSON request body.");
+                return badRequest;
+            }
+
+            if (string.IsNullOrWhiteSpace(payload?.Container) || string.IsNullOrWhiteSpace(payload?.BlobName))
+            {
+                var badRequest = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                await badRequest.WriteStringAsync("'container' and 'blobName' must be provided.");
+                return badRequest;
+            }
+
+            string connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            if (string.IsNullOrWhiteSpace(connectionString))
+            {
+                var error = req.CreateResponse(System.Net.HttpStatusCode.InternalServerError);
+                await error.WriteStringAsync("Storage connection string is not configured.");
+                return error;
+            }
+
+            var blobClient = new BlobClient(connectionString, payload.Container, payload.BlobName);
+
+            if (!await blobClient.ExistsAsync())
+            {
+                var notFound = req.CreateResponse(System.Net.HttpStatusCode.NotFound);
+                await notFound.WriteStringAsync("ZIP blob not found.");
+                return notFound;
+            }
+
+            var extractedFiles = new List<FileResult>();
+
+            // Download ZIP to memory
+            using var zipStream = new MemoryStream();
+            await blobClient.DownloadToAsync(zipStream);
+            zipStream.Position = 0;
+
+            using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Read))
+            {
+                foreach (var entry in archive.Entries)
+                {
+                    // Skip manifest & packageheader
+                    if (entry.FullName.Contains("manifest", StringComparison.OrdinalIgnoreCase) ||
+                        entry.FullName.Contains("packageheader", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    string content;
+                    bool isBinary = false;
+
+                    if (entry.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // Read as text
+                        using var reader = new StreamReader(entry.Open(), Encoding.UTF8);
+                        content = await reader.ReadToEndAsync();
+                    }
+                    else
+                    {
+                        // Read as binary
+                        using var ms = new MemoryStream();
+                        using var entryStream = entry.Open();
+                        await entryStream.CopyToAsync(ms);
+                        content = Convert.ToBase64String(ms.ToArray());
+                        isBinary = true;
+                    }
+
+                    extractedFiles.Add(new FileResult
+                    {
+                        FileName = entry.FullName,
+                        Content = content,
+                        IsBinary = isBinary
+                    });
+                }
+            }
+
+            if (extractedFiles.Count == 0)
+            {
+                var noContent = req.CreateResponse(System.Net.HttpStatusCode.NoContent);
+                noContent.Headers.Add("Content-Type", "application/json");
+                await noContent.WriteStringAsync(JsonSerializer.Serialize(new
+                {
+                    status = "NoFiles",
+                    message = "No valid files found in ZIP."
+                }));
+                return noContent;
+            }
+
+            var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+            response.Headers.Add("Content-Type", "application/json");
+
+            await response.WriteStringAsync(JsonSerializer.Serialize(new
+            {
+                status = "Success",
+                message = "Files extracted successfully.",
+                files = extractedFiles
+            }, new JsonSerializerOptions { WriteIndented = true }));
+
+            return response;
+        }
+
+        public class RequestPayload
+        {
+            public string Container { get; set; }
+            public string BlobName { get; set; }
+        }
+
+        public class FileResult
+        {
+            public string FileName { get; set; } = string.Empty;
+            public string Content { get; set; } = string.Empty;
+            public bool IsBinary { get; set; } = false; // True if content is Base64 (binary)
+        }
+    }
+}

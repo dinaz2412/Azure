@@ -1,0 +1,104 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Text.Json;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+using Azure.Storage.Blobs;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+
+namespace ATF_3475_3546_ExtractRFIAZipFile
+{
+    public class CreateZipFromBlobPaths
+    {
+        private readonly ILogger<CreateZipFromBlobPaths> _logger;
+
+        public CreateZipFromBlobPaths(ILogger<CreateZipFromBlobPaths> logger)
+        {
+            _logger = logger;
+        }
+
+        [Function("CreateZipFromBlobPaths")]
+        public async Task<HttpResponseData> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+        {
+            try
+            {
+                var body = await new StreamReader(req.Body).ReadToEndAsync();
+                var input = JsonSerializer.Deserialize<ZipFromBlobRequest>(body,
+                    new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+
+                if (input == null || input.Files == null || input.Files.Count == 0)
+                    throw new Exception("No files provided.");
+
+                if (string.IsNullOrEmpty(input.EntityName))
+                    throw new Exception("EntityName is required.");
+
+                var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+                var sourceContainerClient = new BlobContainerClient(connectionString, input.SourceContainer);
+                var targetContainerClient = new BlobContainerClient(connectionString, input.TargetContainer);
+                await targetContainerClient.CreateIfNotExistsAsync();
+
+                using var zipStream = new MemoryStream();
+                using (var archive = new ZipArchive(zipStream, ZipArchiveMode.Create, true))
+                {
+                    foreach (var filePath in input.Files)
+                    {
+                        var blobClient = sourceContainerClient.GetBlobClient(filePath);
+                        if (!await blobClient.ExistsAsync())
+                        {
+                            _logger.LogWarning($"Blob not found: {filePath}");
+                            continue;
+                        }
+
+                        string entryName = Path.GetFileName(filePath);
+
+                        // Detect the data XML (not header or manifest)
+                        if (!entryName.Contains("Header", StringComparison.OrdinalIgnoreCase) &&
+                            !entryName.Contains("Manifest", StringComparison.OrdinalIgnoreCase) &&
+                            entryName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                        {
+                            entryName = $"{input.EntityName}.xml";
+                        }
+
+                        var entry = archive.CreateEntry(entryName);
+
+                        using var entryStream = entry.Open();
+                        await blobClient.DownloadToAsync(entryStream);
+                    }
+                }
+
+                zipStream.Position = 0;
+                var zipBlobClient = targetContainerClient.GetBlobClient(input.ZipFileName);
+                await zipBlobClient.UploadAsync(zipStream, overwrite: true);
+
+                var response = req.CreateResponse(System.Net.HttpStatusCode.OK);
+                await response.WriteAsJsonAsync(new
+                {
+                    Message = "ZIP file created successfully",
+                    ZipFilePath = $"{input.TargetContainer}/{input.ZipFileName}",
+                    Entity = input.EntityName,
+                    FileCount = input.Files.Count
+                });
+                return response;
+            }
+            catch (Exception ex)
+            {
+                var error = req.CreateResponse(System.Net.HttpStatusCode.BadRequest);
+                await error.WriteAsJsonAsync(new { Error = ex.Message });
+                return error;
+            }
+        }
+    }
+
+    public class ZipFromBlobRequest
+    {
+        public string ZipFileName { get; set; }
+        public string SourceContainer { get; set; }
+        public string TargetContainer { get; set; }
+        public string EntityName { get; set; }
+        public List<string> Files { get; set; }
+    }
+}

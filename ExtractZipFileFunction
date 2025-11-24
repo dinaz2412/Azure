@@ -1,0 +1,138 @@
+using Azure.Storage.Blobs;
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using Microsoft.Extensions.Logging;
+
+using System.IO.Compression;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+
+namespace ATF_3475_3546_ExtractRFIAZipFile;
+
+public class ATFRFIAExtractZipFileFunction
+{
+    private readonly ILogger<ATFRFIAExtractZipFileFunction> _logger;
+
+    public ATFRFIAExtractZipFileFunction(ILogger<ATFRFIAExtractZipFileFunction> logger)
+    {
+        _logger = logger;
+    }
+
+    [Function("ExtractZipFile")]
+    public async Task<HttpResponseData> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
+    {
+        // Deserialize request body
+        var requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+
+        RequestPayload? payload;
+        try
+        {
+            payload = JsonSerializer.Deserialize<RequestPayload>(requestBody, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Invalid request body.");
+            var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
+            await badRequest.WriteStringAsync("Invalid JSON request body.");
+            return badRequest;
+        }
+
+        if (string.IsNullOrWhiteSpace(payload?.Container) || string.IsNullOrWhiteSpace(payload?.BlobName))
+        {
+            var badRequest = req.CreateResponse(HttpStatusCode.BadRequest);
+            await badRequest.WriteStringAsync("'container' and 'blobName' must be provided.");
+            return badRequest;
+        }
+
+        // Get connection string
+        string? connectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            _logger.LogError("AzureWebJobsStorage connection string is not configured.");
+            var error = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Storage connection string is not configured.");
+            return error;
+        }
+
+        // Build blob client
+        var serviceClient = new BlobServiceClient(connectionString);
+        var containerClient = serviceClient.GetBlobContainerClient(payload.Container);
+        var blobClient = containerClient.GetBlobClient(payload.BlobName);
+
+        if (!await blobClient.ExistsAsync())
+        {
+            var notFound = req.CreateResponse(HttpStatusCode.NotFound);
+            await notFound.WriteStringAsync("ZIP blob not found.");
+            return notFound;
+        }
+
+        string? xmlContent = null;
+
+        try
+        {
+            // Download ZIP
+            using var zipStream = new MemoryStream();
+            await blobClient.DownloadToAsync(zipStream);
+            zipStream.Position = 0;
+
+            using var archive = new ZipArchive(zipStream, ZipArchiveMode.Read);
+            foreach (var entry in archive.Entries)
+            {
+                if (entry.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase) &&
+                    !entry.FullName.Contains("manifest", StringComparison.OrdinalIgnoreCase) &&
+                    !entry.FullName.Contains("packageheader", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var reader = new StreamReader(entry.Open(), Encoding.UTF8);
+                    xmlContent = await reader.ReadToEndAsync();
+                    break;
+                }
+            }
+        }
+        catch (InvalidDataException ex)
+        {
+            _logger.LogError(ex, "Blob is not a valid ZIP file.");
+            var error = req.CreateResponse(HttpStatusCode.BadRequest);
+            await error.WriteStringAsync("Invalid ZIP file.");
+            return error;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error while extracting ZIP.");
+            var error = req.CreateResponse(HttpStatusCode.InternalServerError);
+            await error.WriteStringAsync("Error processing ZIP file.");
+            return error;
+        }
+
+        //  Your condition: XML found vs not found
+        if (!string.IsNullOrWhiteSpace(xmlContent))
+        {
+            // XML found
+            _logger.LogInformation("Extracted XML content successfully.");
+            var okResponse = req.CreateResponse(HttpStatusCode.OK);
+            okResponse.Headers.Add("Content-Type", "application/xml");
+            await okResponse.WriteStringAsync(xmlContent, Encoding.UTF8);
+            return okResponse;
+        }
+        else
+        {
+            _logger.LogWarning("No valid XML found in ZIP.");
+            var errorResponse = req.CreateResponse(HttpStatusCode.UnprocessableEntity);
+            errorResponse.Headers.Add("Content-Type", "application/xml");
+            var errorXml = "<Error>No valid XML file found in ZIP.</Error>";
+            await errorResponse.WriteStringAsync(errorXml, Encoding.UTF8);
+            return errorResponse;
+        }
+    }
+
+    public class RequestPayload
+    {
+        public string Container { get; set; } = string.Empty;
+        public string BlobName { get; set; } = string.Empty;
+    }
+}
